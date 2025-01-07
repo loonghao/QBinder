@@ -34,20 +34,25 @@ qt_dict = {"QtWidgets.%s" % n: m for n, m in inspect.getmembers(QtWidgets)}
 qt_dict.update({"QtCore.%s" % n: m for n, m in inspect.getmembers(QtCore)})
 qt_dict.update({"QtGui.%s" % n: m for n, m in inspect.getmembers(QtGui)})
 
-
 def _cell_factory():
     a = 1
     f = lambda: a + 1
     return f.__closure__[0]
 
-
 CellType = type(_cell_factory())
 
-
 def byte2str(text):
-    # NOTE compat python 2 and 3
-    return str(text, encoding="utf-8") if sys.hexversion >= 0x3000000 else str(text)
-
+    """Convert bytes to str in both Python 2 and 3.
+    
+    Args:
+        text: The text to convert
+        
+    Returns:
+        str: The converted string
+    """
+    if isinstance(text, six.binary_type):
+        return text.decode('utf-8')
+    return six.text_type(text)
 
 def get_method_name(method):
     # NOTE compat Qt 4 and 5
@@ -63,18 +68,65 @@ def get_method_name(method):
         count = method.parameterNames()
     return byte2str(name), count
 
-
 def get_property_count(meta_obj):
     if not isinstance(meta_obj, QtCore.QMetaObject):
         return
     try:
-        count = meta_obj.propertyCount()
-        return count
+        # Check if the object is still valid before accessing
+        if hasattr(meta_obj, 'propertyCount') and isValid(meta_obj):
+            count = meta_obj.propertyCount()
+            return count
     except RuntimeError:
         pass
+    return None
+
+def safe_property_access(obj, property_name, default=None):
+    """Safely access a Qt object's property.
+    
+    Args:
+        obj: The Qt object to access
+        property_name: Name of the property to access
+        default: Default value if property cannot be accessed
+        
+    Returns:
+        The property value or default if access fails
+    """
+    try:
+        if obj and isinstance(obj, QtCore.QObject) and isValid(obj):
+            return obj.property(property_name)
+        return default
+    except Exception:
+        return default
+
+def safe_widget_call(func):
+    """Decorator to safely call Qt widget methods.
+    
+    Args:
+        func: The function to wrap
+        
+    Returns:
+        wrapper: The wrapped function
+    """
+    @six.wraps(func)
+    def wrapper(self, *args, **kwargs):
+        try:
+            if not self or not isinstance(self, QtCore.QObject) or not isValid(self):
+                return None
+            return func(self, *args, **kwargs)
+        except Exception as e:
+            error_msg = six.text_type(e)
+            if "already deleted" in error_msg or "wrapped C/C++ object" in error_msg:
+                return None
+            raise
+    return wrapper
 
 
 def _initialize():
+    """Initialize the HOOKS dictionary with Qt widget information.
+    
+    This function scans Qt widgets and their properties to populate the HOOKS
+    dictionary, but does not perform the actual hook initialization.
+    """
     for name, member in qt_dict.items():
         # NOTE filter qt related func
         if name == "QtGui.QMatrix" or not hasattr(member, "staticMetaObject"):
@@ -86,33 +138,22 @@ def _initialize():
                 if method_name.startswith("set"):
                     _HOOKS_REL[method_name.lower()] = method_name
 
-        # for i in range(meta_obj.methodCount()):
-        #     method = meta_obj.method(i)
-        #     method_name, count = get_method_name(method)
-        #     if count and method.methodType() != QtCore.QMetaMethod.Signal:
-        #         if hasattr(member, method_name):
-        #             HOOKS[name][method_name] = {}
-        #             _HOOKS_REL[name][method_name.lower()] = method_name
-
         # NOTE auto bind updater
         meta_obj = getattr(member, "staticMetaObject", None)
         count = get_property_count(meta_obj)
         if count is None and issubclass(member, QtCore.QObject):
             meta_obj = member().metaObject()
-            count = get_property_count(meta_obj)
 
-        for i in range(count or 0):
-            prop = meta_obj.property(i)
-            if not prop.hasNotifySignal():
-                continue
-            property_name = prop.name()
-            method_name = _HOOKS_REL.get("set%s" % property_name.lower())
-            data = HOOKS[name].get(method_name)
-            if isinstance(data, dict):
-                updater, _ = get_method_name(prop.notifySignal())
+        if count:
+            for i in range(count):
+                property = meta_obj.property(i)
+                property_name = byte2str(property.name())
+                updater = "set%s%s" % (
+                    property_name[0].upper(),
+                    property_name[1:],
+                )
                 if updater:
                     data.update({"updater": updater, "property": property_name})
-
 
 class HookMeta(type):
     def __call__(self, func=None):
@@ -120,7 +161,6 @@ class HookMeta(type):
             return self()(func)
         else:
             return super(HookMeta, self).__call__(func)
-
 
 class HookBase(six.with_metaclass(HookMeta, object)):
     def __init__(self, options=None):
@@ -155,53 +195,112 @@ class HookBase(six.with_metaclass(HookMeta, object)):
                 elif callable(binder):
                     cls.trace_callback(binder, self)
 
+def check_qt_objects(func):
+    """A decorator to check Qt object validity and handle deletion.
+    
+    Args:
+        func: The function to be wrapped
+        
+    Returns:
+        wrapper: The wrapped function that handles Qt object validity
+    """
+    @six.wraps(func)
+    def wrapper(*args, **kwargs):
+        try:
+            # Check if any Qt objects are still valid
+            qt_objects_valid = True
+            for arg in args:
+                if isinstance(arg, QtCore.QObject):
+                    # Check both object validity and parent widget validity
+                    if not isValid(arg) or (hasattr(arg, 'parent') and arg.parent() is None):
+                        qt_objects_valid = False
+                        break
+            if not qt_objects_valid:
+                return None
+            return func(*args, **kwargs)
+        except (RuntimeError, AttributeError) as e:
+            error_msg = six.text_type(e)
+            if "already deleted" in error_msg or "wrapped C/C++ object" in error_msg:
+                return None
+            raise
+    return wrapper
 
 class MethodHook(HookBase):
     @staticmethod
     def auto_dump(binding):
-        """auto dump for two way binding"""
+        """Auto dump for two way binding.
+        
+        This method handles the automatic dumping of bindings based on the AUTO_DUMP
+        configuration. It also sets up the dumper filters for the binding.
+        
+        Args:
+            binding: The binding object to handle
+            
+        Returns:
+            The result of binding.dump() if AUTO_DUMP is enabled and binding exists
+        """
         from .constant import AUTO_DUMP
 
-        binder = binding.__binder__
-        if not AUTO_DUMP or not binder:
-            return
-        dumper = binder("dumper")
-        for k, v in binder._var_dict_.items():
-            if v is binding:
-                dumper._filters_.add(k)
-                break
+        if not binding:
+            return None
+            
+        try:
+            binder = getattr(binding, '__binder__', None)
+            if not AUTO_DUMP or not binder:
+                return None
+                
+            # Get the dumper and set up filters
+            dumper = binder("dumper")
+            if dumper and hasattr(binder, '_var_dict_'):
+                for key, value in binder._var_dict_.items():
+                    if value is binding:
+                        dumper._filters_.add(key)
+                        break
+                        
+            return binding.dump()
+            
+        except Exception as e:
+            error_msg = six.text_type(e)
+            print("Error in auto_dump: {}".format(error_msg))
+            return None
 
     @staticmethod
     def remember_cursor_position(callback):
         """maintain the Qt edit cusorPosition after setting a new value"""
 
+        @safe_widget_call
         def wrapper(self, *args, **kwargs):
-            if self and not isValid(self):
-                del self
-                return
             setter = None
             cursor_pos = 0
-            pos = self.property("cursorPosition")
+            
+            # Use safe property access
+            pos = safe_property_access(self, "cursorPosition")
+            
             # NOTE for editable combobox
             if pos and isinstance(self, QtWidgets.QComboBox):
                 edit = self.lineEdit()
-                pos = edit.property("cursorPosition")
+                pos = safe_property_access(edit, "cursorPosition")
             elif isinstance(self, QtWidgets.QTextEdit):
                 cursor = self.textCursor()
-                cursor_pos = cursor.position()
+                cursor_pos = cursor.position() if cursor else 0
 
-            callback(self, *args, **kwargs)
+            result = callback(self, *args, **kwargs)
 
-            # NOTE wait for two event call
-            if cursor_pos:
-                total = len(self.toPlainText())
-                cursor.setPosition(total if cursor_pos > total else cursor_pos)
-                setter = partial(self.setTextCursor, cursor)
-            elif not pos is None:
-                setter = partial(self.setProperty, "cursorPosition", pos)
+            # Only set properties if object is still valid
+            if isValid(self):
+                if cursor_pos and isinstance(self, QtWidgets.QTextEdit):
+                    total = len(self.toPlainText())
+                    cursor = self.textCursor()
+                    if cursor:
+                        cursor.setPosition(total if cursor_pos > total else cursor_pos)
+                        setter = partial(self.setTextCursor, cursor)
+                elif pos is not None:
+                    setter = partial(self.setProperty, "cursorPosition", pos)
 
-            if callable(setter):
-                QtCore.QTimer.singleShot(0, setter)
+                if callable(setter):
+                    QtCore.QTimer.singleShot(0, setter)
+
+            return result
 
         return wrapper
 
@@ -259,51 +358,98 @@ class MethodHook(HookBase):
 
         return wrapper
 
-
 class FuncHook(HookBase):
     def __call__(self, func):
         from .binding import Binding
 
         @six.wraps(func)
+        @check_qt_objects
         def wrapper(*args, **kwargs):
             if len(args) != 1:
                 return func(*args, **kwargs)
 
             callback = args[0]
+            if not callback:
+                return None
 
-            if isinstance(callback, types.LambdaType):
+            try:
+                if isinstance(callback, types.LambdaType):
+                    # NOTE get the running bindings (with __get__ method) add to Binding._trace_dict_
+                    with Binding.set_trace():
+                        val = callback()
+                        if val is None:  # Early return if callback returns None
+                            return None
+                        self.trace_callback(callback)
 
-                # NOTE get the running bindings (with __get__ method) add to Binding._trace_dict_
-                with Binding.set_trace():
-                    val = callback()
-                    self.trace_callback(callback)
+                    def connect_callback(callback, args):
+                        try:
+                            val = callback()
+                            if val is not None:  # Only proceed if we get a valid value
+                                args = self.combine_args(val, args)
+                                func(*args, **kwargs)
+                        except Exception as e:
+                            if "already deleted" not in six.text_type(e):
+                                raise
 
-                def connect_callback(callback, args):
-                    val = callback()
-                    args = self.combine_args(val, args)
-                    func(*args, **kwargs)
+                    # NOTE register auto update
+                    _callback_ = partial(connect_callback, callback, args[1:])
+                    for binding in Binding._trace_dict_.values():
+                        if binding is not None:  # Check if binding is still valid
+                            binding.connect(_callback_)
 
-                # NOTE register auto update
-                _callback_ = partial(connect_callback, callback, args[1:])
-                for binding in Binding._trace_dict_.values():
-                    binding.connect(_callback_)
-
-                args = self.combine_args(val, args[1:])
-            return func(*args, **kwargs)
+                    args = self.combine_args(val, args[1:])
+                return func(*args, **kwargs)
+                
+            except Exception as e:
+                if "already deleted" in six.text_type(e):
+                    return None
+                raise
 
         return wrapper
 
-
 def hook_initialize(hooks):
+    """Dynamic wrap the Qt Widget setter based on the HOOKS Definition.
+    
+    This function wraps Qt Widget setters with MethodHook to enable property binding
+    and event handling. It safely handles cases where widgets or methods might not exist.
+    
+    Args:
+        hooks (dict): Dictionary containing widget and setter mappings
+            Format: {"QtWidgets.WidgetName": {"setterName": options}}
     """
-    # NOTE Dynamic wrap the Qt Widget setter base on the HOOKS Definition
-    """
-    for widget, setters in hooks.items():
-        lib, widget = widget.split(".")
-        widget = getattr(getattr(Qt, lib), widget)
-        for setter, options in setters.items():
-            func = getattr(widget, setter)
-            setattr(widget, setter, MethodHook(options)(func))
-
+    for widget_path, setters in hooks.items():
+        try:
+            # Split module and widget name
+            lib, widget_name = widget_path.split(".")
+            # Get the Qt module (QtWidgets, QtCore, etc)
+            qt_module = getattr(Qt, lib, None)
+            if qt_module is None:
+                continue
+                
+            # Get the widget class
+            widget_class = getattr(qt_module, widget_name, None)
+            if widget_class is None:
+                continue
+                
+            # Wrap each setter method
+            for setter, options in setters.items():
+                try:
+                    # Get the original setter method
+                    original_func = getattr(widget_class, setter, None)
+                    if original_func is not None:
+                        # First wrap with safe_widget_call, then with MethodHook
+                        safe_func = safe_widget_call(original_func)
+                        wrapped = MethodHook(options)(safe_func)
+                        setattr(widget_class, setter, wrapped)
+                except (AttributeError, TypeError) as e:
+                    error_msg = six.text_type(e)
+                    print("Error wrapping setter {}.{}: {}".format(
+                        widget_path, setter, error_msg))
+                    continue
+        except Exception as e:
+            error_msg = six.text_type(e)
+            print("Error processing widget {}: {}".format(
+                widget_path, error_msg))
+            continue
 
 _initialize()
